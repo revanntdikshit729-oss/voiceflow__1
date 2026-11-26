@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Production Build
+dist/
+
+# Environment Variables (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS Artifacts
+.DS_Store
+Thumbs.db

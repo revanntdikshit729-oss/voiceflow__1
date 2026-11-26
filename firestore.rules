@@ -1,0 +1,505 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // =========================================================================
+    // 0. CORE HELPERS & STRICT ROLE VERIFICATION
+    // =========================================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // ROLE VERIFICATION:
+    // A user is a verified doctor ONLY if:
+    // 1. Their document exists in /doctors/{uid}
+    // 2. AND isVerified == true (assigned by trusted server/admin)
+    // 3. User document /users/{uid} has role == 'doctor'
+    // Ordinary users or patients CANNOT gain doctor privileges simply by self-declaring role='doctor'.
+    function isVerifiedDoctor() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/doctors/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/doctors/$(request.auth.uid)).data.isVerified == true &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'doctor';
+    }
+    
+    function isDoctor() {
+      return isVerifiedDoctor();
+    }
+    
+    // TWO-TIER AUTHORIZATION WITH DEFENSE-IN-DEPTH:
+    // Doctor is authorized for a patient IF AND ONLY IF:
+    // 1. Requester is a verified doctor
+    // 2. Patient document exists and lists doctor UID in authorizedDoctorIds
+    // 3. Consent document exists and has status == 'active'
+    // If patient revokes consent (removing doctor UID or setting consent to revoked),
+    // this immediately returns false for all records, even if a stale connection request exists.
+    function isAuthorizedDoctorForPatient(patientId) {
+      let consentPath = /databases/$(database)/documents/consents/$(patientId + '_' + request.auth.uid);
+      return isAuthenticated() &&
+        isDoctor() &&
+        exists(/databases/$(database)/documents/patients/$(patientId)) &&
+        ('authorizedDoctorIds' in get(/databases/$(database)/documents/patients/$(patientId)).data) &&
+        (get(/databases/$(database)/documents/patients/$(patientId)).data.authorizedDoctorIds is list) &&
+        (request.auth.uid in get(/databases/$(database)/documents/patients/$(patientId)).data.authorizedDoctorIds) &&
+        exists(consentPath) &&
+        get(consentPath).data.status == 'active';
+    }
+    
+    // ATOMIC APPROVAL VALIDATION WITH getAfter():
+    // Verifies that:
+    // 1. Prior to batch commit: request existed with status == 'pending' addressed to this doctor
+    // 2. Result of batch commit (getAfter):
+    //    - connection_requests status is 'accepted'
+    //    - patients authorizedDoctorIds includes doctor UID
+    //    - consents status is 'active'
+    // Guarantees atomic synchronization between connection_requests, patients, and consents.
+    function isLegitimateAtomicApproval(patientId) {
+      let reqPath = /databases/$(database)/documents/connection_requests/$(patientId + '_' + request.auth.uid);
+      let patPath = /databases/$(database)/documents/patients/$(patientId);
+      let conPath = /databases/$(database)/documents/consents/$(patientId + '_' + request.auth.uid);
+      return exists(reqPath) &&
+        get(reqPath).data.patientId == patientId &&
+        get(reqPath).data.doctorId == request.auth.uid &&
+        get(reqPath).data.status == 'pending' &&
+        getAfter(reqPath).data.status == 'accepted' &&
+        getAfter(patPath).data.authorizedDoctorIds.hasAny([request.auth.uid]) &&
+        getAfter(conPath).data.status == 'active';
+    }
+
+    // ATOMIC REJECTION VALIDATION WITH getAfter():
+    // Verifies that:
+    // 1. Prior to batch commit: request existed with status == 'pending' addressed to this doctor
+    // 2. Result of batch commit (getAfter):
+    //    - connection_requests status is 'rejected'
+    //    - consents status is 'rejected'
+    function isLegitimateAtomicRejection(patientId) {
+      let reqPath = /databases/$(database)/documents/connection_requests/$(patientId + '_' + request.auth.uid);
+      let conPath = /databases/$(database)/documents/consents/$(patientId + '_' + request.auth.uid);
+      return exists(reqPath) &&
+        get(reqPath).data.patientId == patientId &&
+        get(reqPath).data.doctorId == request.auth.uid &&
+        get(reqPath).data.status == 'pending' &&
+        getAfter(reqPath).data.status == 'rejected' &&
+        getAfter(conPath).data.status == 'rejected';
+    }
+
+    // =========================================================================
+    // 1. USERS COLLECTION
+    // - Read: STRICTLY restricted to account owner. No user can browse private emails or roles.
+    // - Create: Account owner can create initial profile with valid role and explicit fields.
+    // - Update: Role, email, and uid are strictly IMMUTABLE.
+    // =========================================================================
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isAuthenticated() && 
+        request.auth.uid == userId &&
+        request.resource.data.role in ['patient', 'doctor'] &&
+        request.resource.data.uid == userId &&
+        request.resource.data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'role', 'preferredLanguage', 'createdAt']);
+      allow update: if isOwner(userId) &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.uid == resource.data.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'photoURL', 'preferredLanguage', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 2. PATIENT PROFILES
+    // - Read: Only the patient OR an authorized doctor with active consent.
+    // - Update:
+    //   * Patient can update only permitted profile fields.
+    //   * Patient CANNOT add doctors to authorizedDoctorIds via profile updates (only remove/revoke).
+    //   * Doctor can ONLY update authorizedDoctorIds & timestamps during approval, AND MUST
+    //     prove legitimate atomic approval via isLegitimateAtomicApproval(patientId).
+    //   * Doctor can remove themselves upon unlinking.
+    // =========================================================================
+    match /patients/{patientId} {
+      allow read: if isOwner(patientId) || isAuthorizedDoctorForPatient(patientId);
+      
+      allow create: if isOwner(patientId) &&
+        request.resource.data.patientId == patientId &&
+        (!('authorizedDoctorIds' in request.resource.data) || request.resource.data.authorizedDoctorIds.size() == 0);
+      
+      allow update: if (
+        // Case 1: Patient updating profile fields or revoking doctor access
+        (
+          isOwner(patientId) &&
+          request.resource.data.patientId == resource.data.patientId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'fullName', 'photoURL', 'preferredLanguage', 'gender', 'dateOfBirth', 'bloodGroup',
+            'emergencyContact', 'medicalHistory', 'uniquePatientId', 'updatedAt', 'updatedAtServer',
+            'authorizedDoctorIds'
+          ]) &&
+          // Protected authorization: Patient CANNOT add doctor IDs via profile update.
+          // Patient can ONLY remove existing doctor IDs to revoke access.
+          (
+            (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['authorizedDoctorIds'])) ||
+            (
+              resource.data.authorizedDoctorIds is list &&
+              request.resource.data.authorizedDoctorIds is list &&
+              resource.data.authorizedDoctorIds.hasAll(request.resource.data.authorizedDoctorIds) &&
+              request.resource.data.authorizedDoctorIds.size() < resource.data.authorizedDoctorIds.size()
+            )
+          )
+        ) ||
+        // Case 2: Doctor adding themselves via atomic approval or removing themselves
+        (
+          isDoctor() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['authorizedDoctorIds', 'updatedAt', 'updatedAtServer']) &&
+          (
+            // Doctor adding themselves: REQUIRES verified doctor AND legitimate atomic approval!
+            (
+              request.auth.uid in request.resource.data.authorizedDoctorIds &&
+              !(request.auth.uid in resource.data.authorizedDoctorIds) &&
+              request.resource.data.authorizedDoctorIds.hasAll(resource.data.authorizedDoctorIds) &&
+              request.resource.data.authorizedDoctorIds.size() == resource.data.authorizedDoctorIds.size() + 1 &&
+              isLegitimateAtomicApproval(patientId)
+            ) ||
+            // Doctor removing themselves:
+            (
+              !(request.auth.uid in request.resource.data.authorizedDoctorIds) &&
+              resource.data.authorizedDoctorIds.hasAll(request.resource.data.authorizedDoctorIds) &&
+              request.resource.data.authorizedDoctorIds.size() == resource.data.authorizedDoctorIds.size() - 1
+            )
+          )
+        )
+      );
+      
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 3. DOCTOR PROFILES
+    // - Public directory readable ONLY for verified doctors (resource.data.isVerified == true).
+    // - Doctor can read their own profile even if unverified.
+    // - Create: Cannot self-verify (isVerified must not be true).
+    // - Update: isVerified is IMMUTABLE by doctor (only admin/server can verify).
+    // =========================================================================
+    match /doctors/{doctorId} {
+      allow read: if isAuthenticated() && (
+        isOwner(doctorId) || (resource.data.isVerified == true)
+      );
+      allow create: if isOwner(doctorId) &&
+        request.resource.data.doctorId == doctorId &&
+        (!('isVerified' in request.resource.data) || request.resource.data.isVerified == false) &&
+        request.resource.data.keys().hasOnly([
+          'doctorId', 'fullName', 'photoURL', 'specialization', 'registrationNumber', 
+          'clinicOrHospital', 'qualifications', 'description', 'isVerified', 
+          'preferredLanguage', 'createdAt'
+        ]);
+      allow update: if isOwner(doctorId) &&
+        request.resource.data.doctorId == resource.data.doctorId &&
+        (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['isVerified', 'verifiedAt'])) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'fullName', 'photoURL', 'specialization', 'registrationNumber', 
+          'clinicOrHospital', 'qualifications', 'description', 
+          'preferredLanguage', 'updatedAt', 'updatedAtServer'
+        ]);
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 4. CONNECTION REQUESTS
+    // - Canonical Document ID: /connection_requests/{patientId}_{doctorId}
+    // - Creation: Patient creates ONLY with status 'pending'. Doctor creates ONLY with status 'pending'.
+    // - Update / State Transitions:
+    //   * Doctor accepts ONLY if atomic batch commits patient authorization and active consent.
+    //   * Doctor rejects ONLY if atomic batch commits rejected consent.
+    //   * Patient can cancel/revoke ONLY to 'cancelled' or 'revoked'. CANNOT SELF-APPROVE.
+    //   * Immutable fields: patientId, doctorId, createdAt, id cannot be changed.
+    // =========================================================================
+    match /connection_requests/{requestId} {
+      allow read: if isAuthenticated() && (
+        resource.data.patientId == request.auth.uid ||
+        resource.data.doctorId == request.auth.uid
+      );
+
+      allow create: if isAuthenticated() && (
+        // Patient creating request to a doctor with strict type and size validation
+        request.resource.data.patientId == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.initiatedBy == 'patient' &&
+        request.resource.data.doctorId is string &&
+        request.resource.data.doctorId.size() > 0 &&
+        request.resource.data.doctorId.size() <= 128 &&
+        request.resource.data.doctorId != request.auth.uid &&
+        requestId == request.auth.uid + '_' + request.resource.data.doctorId &&
+        request.resource.data.id == requestId &&
+        request.resource.data.patientName is string &&
+        request.resource.data.patientName.size() > 0 &&
+        request.resource.data.patientName.size() <= 150 &&
+        request.resource.data.doctorName is string &&
+        request.resource.data.doctorName.size() > 0 &&
+        request.resource.data.doctorName.size() <= 150 &&
+        request.resource.data.doctorSpecialization is string &&
+        request.resource.data.doctorSpecialization.size() > 0 &&
+        request.resource.data.doctorSpecialization.size() <= 150 &&
+        request.resource.data.doctorClinic is string &&
+        request.resource.data.doctorClinic.size() > 0 &&
+        request.resource.data.doctorClinic.size() <= 200 &&
+        request.resource.data.doctorRegNumber is string &&
+        request.resource.data.doctorRegNumber.size() > 0 &&
+        request.resource.data.doctorRegNumber.size() <= 100 &&
+        request.resource.data.createdAt is string &&
+        request.resource.data.createdAt.size() <= 50 &&
+        (!('uniquePatientId' in request.resource.data) || (request.resource.data.uniquePatientId is string && request.resource.data.uniquePatientId.size() <= 50)) &&
+        (!('patientEmail' in request.resource.data) || (request.resource.data.patientEmail is string && request.resource.data.patientEmail.size() <= 150)) &&
+        (!('patientPhotoURL' in request.resource.data) || (request.resource.data.patientPhotoURL is string && request.resource.data.patientPhotoURL.size() <= 2000)) &&
+        (!('doctorPhotoURL' in request.resource.data) || (request.resource.data.doctorPhotoURL is string && request.resource.data.doctorPhotoURL.size() <= 2000)) &&
+        (!('requestNote' in request.resource.data) || (request.resource.data.requestNote is string && request.resource.data.requestNote.size() <= 1000)) &&
+        request.resource.data.keys().hasAll(['id', 'patientId', 'doctorId', 'status', 'createdAt', 'initiatedBy']) &&
+        request.resource.data.keys().hasOnly([
+          'id', 'patientId', 'uniquePatientId', 'patientName', 'patientEmail', 'patientPhotoURL', 
+          'doctorId', 'doctorName', 'doctorSpecialization', 'doctorClinic', 
+          'doctorRegNumber', 'doctorPhotoURL', 'status', 'requestNote', 
+          'initiatedBy', 'createdAt', 'createdAtServer', 'updatedAtServer'
+        ])
+      );
+
+      allow update: if isAuthenticated() &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.patientId == resource.data.patientId &&
+        request.resource.data.doctorId == resource.data.doctorId &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'updatedAtServer']) &&
+        (
+          // Doctor approving: MUST be recipient doctor, MUST be in 'pending' status,
+          // AND MUST commit patient authorization and active consent in the same atomic batch!
+          (
+            isDoctor() &&
+            resource.data.doctorId == request.auth.uid &&
+            resource.data.status == 'pending' &&
+            request.resource.data.status == 'accepted' &&
+            getAfter(/databases/$(database)/documents/patients/$(resource.data.patientId)).data.authorizedDoctorIds.hasAny([request.auth.uid]) &&
+            getAfter(/databases/$(database)/documents/consents/$(resource.data.patientId + '_' + request.auth.uid)).data.status == 'active'
+          ) ||
+          // Doctor rejecting: MUST be recipient doctor, MUST be in 'pending' status
+          (
+            isDoctor() &&
+            resource.data.doctorId == request.auth.uid &&
+            resource.data.status == 'pending' &&
+            request.resource.data.status == 'rejected' &&
+            getAfter(/databases/$(database)/documents/consents/$(resource.data.patientId + '_' + request.auth.uid)).data.status == 'rejected'
+          ) ||
+          // Patient cancelling/revoking: Patient CANNOT transition to 'accepted' or 'approved'
+          (
+            resource.data.patientId == request.auth.uid &&
+            (
+              (resource.data.status == 'pending' && request.resource.data.status in ['cancelled', 'revoked']) ||
+              (resource.data.status == 'accepted' && request.resource.data.status == 'revoked')
+            )
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 5. CONSENT RECORDS
+    // - Document ID: /consents/{patientId}_{doctorId}
+    // - Doctor CANNOT create or activate consent without atomic approval batch.
+    // - Doctor CANNOT un-revoke or reverse patient revocation.
+    // =========================================================================
+    match /consents/{consentId} {
+      allow read: if isAuthenticated() && (
+        resource.data.patientId == request.auth.uid ||
+        resource.data.doctorId == request.auth.uid
+      );
+
+      allow create: if isAuthenticated() &&
+        request.resource.data.keys().hasAll(['patientId', 'doctorId', 'status']) &&
+        request.resource.data.keys().hasOnly(['patientId', 'doctorId', 'status', 'grantedAt', 'rejectedAt', 'revokedAt', 'updatedAt', 'updatedAtServer']) &&
+        (
+          // Patient granting or revoking consent
+          (
+            request.resource.data.patientId == request.auth.uid &&
+            request.resource.data.doctorId is string &&
+            consentId == request.auth.uid + '_' + request.resource.data.doctorId &&
+            request.resource.data.status in ['active', 'revoked']
+          ) ||
+          // Doctor responding: REQUIRES legitimate atomic approval (for active) or atomic rejection (for rejected)
+          (
+            isDoctor() &&
+            request.resource.data.doctorId == request.auth.uid &&
+            request.resource.data.patientId is string &&
+            consentId == request.resource.data.patientId + '_' + request.auth.uid &&
+            (
+              (request.resource.data.status == 'active' && isLegitimateAtomicApproval(request.resource.data.patientId)) ||
+              (request.resource.data.status == 'rejected' && isLegitimateAtomicRejection(request.resource.data.patientId))
+            )
+          )
+        );
+
+      allow update: if isAuthenticated() &&
+        request.resource.data.patientId == resource.data.patientId &&
+        request.resource.data.doctorId == resource.data.doctorId &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'revokedAt', 'rejectedAt', 'grantedAt', 'updatedAt', 'updatedAtServer']) &&
+        (
+          // Patient revoking or updating consent
+          (
+            resource.data.patientId == request.auth.uid &&
+            request.resource.data.status in ['active', 'revoked']
+          ) ||
+          // Doctor updating consent:
+          // DOCTORS CANNOT UN-REVOKE PATIENT REVOCATION!
+          (
+            isDoctor() &&
+            resource.data.doctorId == request.auth.uid &&
+            resource.data.status != 'revoked' &&
+            (
+              (request.resource.data.status == 'active' && isLegitimateAtomicApproval(resource.data.patientId)) ||
+              (request.resource.data.status == 'rejected' && isLegitimateAtomicRejection(resource.data.patientId))
+            )
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 6. CLINICAL CONSULTATIONS (Baseline & Follow-ups)
+    // - Patient CANNOT create or alter doctor-authored consultations.
+    // - Doctor can create/update only if actively authorized (defense-in-depth with active consent).
+    // - Doctor updates restricted to clinical fields; cannot change baseline status, timestamps, or IDs.
+    // =========================================================================
+    match /consultations/{consultationId} {
+      allow read: if isAuthenticated() && (
+        resource.data.patientId == request.auth.uid ||
+        (isDoctor() && isAuthorizedDoctorForPatient(resource.data.patientId))
+      );
+      
+      // Authorized doctor creates consultation
+      allow create: if isDoctor() &&
+        request.resource.data.doctorId == request.auth.uid &&
+        isAuthorizedDoctorForPatient(request.resource.data.patientId) &&
+        request.resource.data.id == consultationId &&
+        request.resource.data.keys().hasAll(['id', 'patientId', 'doctorId', 'consultationDate', 'diagnosis', 'treatmentPlan', 'createdAt']) &&
+        request.resource.data.keys().hasOnly([
+          'id', 'patientId', 'doctorId', 'doctorName', 'doctorSpecialization', 
+          'doctorRegNumber', 'isInitialBaseline', 'consultationDate', 
+          'chiefComplaints', 'diagnosis', 'baselineSymptoms', 'treatmentPlan', 
+          'followUpAdvice', 'reviewDate', 'notes', 'createdAt'
+        ]);
+
+      // Authoring doctor can update clinical fields only; cannot alter patientId, doctorId, or isInitialBaseline
+      allow update: if isDoctor() &&
+        resource.data.doctorId == request.auth.uid &&
+        isAuthorizedDoctorForPatient(resource.data.patientId) &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.patientId == resource.data.patientId &&
+        request.resource.data.doctorId == resource.data.doctorId &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        (!('isInitialBaseline' in resource.data) || request.resource.data.isInitialBaseline == resource.data.isInitialBaseline) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'diagnosis', 'treatmentPlan', 'followUpAdvice', 'baselineSymptoms', 
+          'chiefComplaints', 'reviewDate', 'notes', 'updatedAt', 'updatedAtServer'
+        ]);
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 7. HEALTH UPDATES (Patient Voice Updates & Summaries)
+    // - Patient owns and reads all updates.
+    // - Authorized doctor can read ONLY confirmed updates (isConfirmed == true AND active consent).
+    // - Once confirmed, summary, transcript, and confirmation metadata are IMMUTABLE.
+    // - Doctors cannot create, edit, or tamper with patient updates.
+    // =========================================================================
+    match /health_updates/{updateId} {
+      allow read: if isAuthenticated() && (
+        resource.data.patientId == request.auth.uid ||
+        (
+          isAuthorizedDoctorForPatient(resource.data.patientId) &&
+          resource.data.isConfirmed == true
+        )
+      );
+
+      allow create: if isAuthenticated() &&
+        request.resource.data.patientId == request.auth.uid &&
+        request.resource.data.id == updateId &&
+        request.resource.data.keys().hasAll(['id', 'patientId', 'rawTranscript', 'language', 'isConfirmed', 'createdAt']) &&
+        request.resource.data.keys().hasOnly([
+          'id', 'patientId', 'consultationId', 'baselineConsultationId', 
+          'rawTranscript', 'originalLanguage', 'language', 'preferredLanguage', 
+          'finalConfirmedSummary', 'structuredSummary', 'correctionHistory', 
+          'comparisonWithBaseline', 'isConfirmed', 'status', 'confirmedAt', 'createdAt'
+        ]) &&
+        // If created as confirmed, summary and timestamp must be provided
+        (request.resource.data.isConfirmed == false || 
+         (request.resource.data.finalConfirmedSummary is string && 
+          request.resource.data.finalConfirmedSummary.size() > 0 && 
+          request.resource.data.confirmedAt is string));
+
+      allow update: if isAuthenticated() &&
+        resource.data.patientId == request.auth.uid &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.patientId == resource.data.patientId &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        // If record was already confirmed, confirmed summary, raw transcript, and confirmation timestamp are IMMUTABLE
+        (
+          resource.data.isConfirmed != true ||
+          (
+            request.resource.data.isConfirmed == true &&
+            request.resource.data.finalConfirmedSummary == resource.data.finalConfirmedSummary &&
+            request.resource.data.rawTranscript == resource.data.rawTranscript &&
+            request.resource.data.confirmedAt == resource.data.confirmedAt
+          )
+        );
+
+      allow delete: if isOwner(resource.data.patientId);
+    }
+
+    // =========================================================================
+    // 8. INTELLIGENT HEALTH CHANGE BRIEFS
+    // - Longitudinal AI comparison: accessible by patient and actively authorized doctors.
+    // - Creation: Patient or authorized doctor with validated field allowlist.
+    // - Doctor review: Doctor can ONLY update clinical observations and review metadata.
+    //   Cannot overwrite AI comparison history or patient-confirmed data.
+    // =========================================================================
+    match /health_change_briefs/{briefId} {
+      allow read: if isAuthenticated() && (
+        resource.data.patientId == request.auth.uid ||
+        isAuthorizedDoctorForPatient(resource.data.patientId)
+      );
+
+      allow create: if isAuthenticated() &&
+        request.resource.data.id == briefId &&
+        request.resource.data.keys().hasAll(['id', 'patientId', 'quickSummary', 'hasReliableComparison', 'isReviewedByDoctor']) &&
+        request.resource.data.keys().hasOnly([
+          'id', 'patientId', 'generatedAt', 'doctorLanguage', 'previousRecord', 
+          'latestRecord', 'hasReliableComparison', 'unreliableReason', 
+          'quickSummary', 'categories', 'patientReportedContext', 
+          'clinicalObservations', 'isReviewedByDoctor', 'reviewedBy', 
+          'createdAtServer', 'updatedAtServer'
+        ]) &&
+        (
+          request.resource.data.patientId == request.auth.uid ||
+          isAuthorizedDoctorForPatient(request.resource.data.patientId)
+        );
+
+      allow update: if isDoctor() &&
+        isAuthorizedDoctorForPatient(resource.data.patientId) &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.patientId == resource.data.patientId &&
+        request.resource.data.quickSummary == resource.data.quickSummary &&
+        request.resource.data.hasReliableComparison == resource.data.hasReliableComparison &&
+        (!('categories' in resource.data) || request.resource.data.categories == resource.data.categories) &&
+        (!('previousRecord' in resource.data) || request.resource.data.previousRecord == resource.data.previousRecord) &&
+        (!('latestRecord' in resource.data) || request.resource.data.latestRecord == resource.data.latestRecord) &&
+        (!('patientReportedContext' in resource.data) || request.resource.data.patientReportedContext == resource.data.patientReportedContext) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'clinicalObservations', 'isReviewedByDoctor', 'reviewedBy', 'updatedAtServer'
+        ]) &&
+        request.resource.data.reviewedBy.doctorId == request.auth.uid &&
+        request.resource.data.isReviewedByDoctor == true;
+
+      allow delete: if false;
+    }
+  }
+}

@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# TypeScript Build Output
+dist/
+
+# Environment Variables & Secrets (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.local
+
+# Service Account Keys & Certificates
+serviceAccountKey*.json
+*firebase-adminsdk*.json
+*credentials*.json
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS Artifacts
+.DS_Store
+Thumbs.db

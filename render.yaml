@@ -1,0 +1,33 @@
+services:
+  # VoiceFlow All-in-One Full-Stack Service on Render
+  # Builds both the React Vite client and Express Node.js server
+  - type: web
+    name: voiceflow-app
+    env: node
+    plan: free
+    buildCommand: npm run install:all && npm run build
+    startCommand: node server/dist/index.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FIREBASE_PROJECT_ID
+        value: voiceflow-f53b8
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash-lite
+      - key: VITE_FIREBASE_PROJECT_ID
+        value: voiceflow-f53b8
+      - key: VITE_FIREBASE_AUTH_DOMAIN
+        value: voiceflow-f53b8.firebaseapp.com
+      - key: VITE_FIREBASE_STORAGE_BUCKET
+        value: voiceflow-f53b8.firebasestorage.app
+      - key: VITE_FIREBASE_API_KEY
+        sync: false
+      - key: VITE_FIREBASE_MESSAGING_SENDER_ID
+        sync: false
+      - key: VITE_FIREBASE_APP_ID
+        sync: false

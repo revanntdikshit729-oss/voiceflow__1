@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -37,9 +38,10 @@ app.use(cors({
     const isExplicitlyAllowed = allowedOrigins.includes(origin);
     const isVercelDomain = /\.vercel\.app$/.test(new URL(origin).hostname);
     const isNetlifyDomain = /\.netlify\.app$/.test(new URL(origin).hostname);
+    const isRenderDomain = /\.onrender\.com$/.test(new URL(origin).hostname);
     const isDevMode = process.env.NODE_ENV !== 'production';
 
-    if (isExplicitlyAllowed || isVercelDomain || isNetlifyDomain || isDevMode) {
+    if (isExplicitlyAllowed || isVercelDomain || isNetlifyDomain || isRenderDomain || isDevMode) {
       return callback(null, true);
     }
 
@@ -65,6 +67,25 @@ app.get('/api/health', (req, res) => {
 // Mount routes
 app.use('/api/auth', authRouter);
 app.use('/api/ai', aiRouter);
+
+// In production or single-service deployment, serve Vite client build if present
+const clientDistPath = path.resolve(__dirname, '../../client/dist');
+const altClientDistPath = path.resolve(process.cwd(), 'client/dist');
+const activeDistPath = fs.existsSync(clientDistPath)
+  ? clientDistPath
+  : fs.existsSync(altClientDistPath)
+  ? altClientDistPath
+  : null;
+
+if (activeDistPath) {
+  app.use(express.static(activeDistPath));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) {
+      return next();
+    }
+    res.sendFile(path.join(activeDistPath, 'index.html'));
+  });
+}
 
 export { app };
 

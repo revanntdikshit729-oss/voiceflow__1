@@ -25,7 +25,12 @@ import {
   X,
   Globe,
   FileText,
+  Pill,
 } from 'lucide-react';
+import { cleanWisprTranscript, detectEmergencyRedFlags, EmergencyRedFlag } from '../../services/wisprFlowEngine';
+import { WisprAudioVisualizer } from '../voice/WisprAudioVisualizer';
+import { EmergencyRedFlagModal } from '../medical/EmergencyRedFlagModal';
+import { PrescriptionExplainerModal } from './PrescriptionExplainerModal';
 import { useAuth } from '../../contexts/AuthContext';
 import { useVoiceNavigation } from '../../contexts/VoiceNavigationContext';
 import { getSpokenFeedbackForIntent } from '../../services/voiceNavigation';
@@ -112,6 +117,11 @@ export const PatientDashboard: React.FC = () => {
   // Selected Timeline Entry for Detail Modal
   const [selectedTimelineEntry, setSelectedTimelineEntry] = useState<TimelineEntry | null>(null);
   const [isDetailSpeaking, setIsDetailSpeaking] = useState(false);
+
+  // Wispr Flow Audio Stream & Triage Red Flags
+  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
+  const [activeRedFlag, setActiveRedFlag] = useState<EmergencyRedFlag | null>(null);
+  const [explainingConsultation, setExplainingConsultation] = useState<Consultation | null>(null);
 
   // Connection Requests & Doctor Access
   const [connectionRequests, setConnectionRequests] = useState<ConnectionRequest[]>([]);
@@ -253,15 +263,25 @@ export const PatientDashboard: React.FC = () => {
     };
   }, [activeRecognition, correctionRecognition]);
 
-  // Start / Stop Main Voice Recording
+  // Start / Stop Main Voice Recording with Wispr Audio Stream & Emergency Guardrails
   const toggleRecording = () => {
     if (interactionState === 'listening') {
       if (activeRecognition) {
         activeRecognition.stop();
         setActiveRecognition(null);
       }
+      if (audioStream) {
+        audioStream.getTracks().forEach((track) => track.stop());
+        setAudioStream(null);
+      }
       if (transcript.trim()) {
-        handleProcessTranscript(transcript);
+        const cleaned = cleanWisprTranscript(transcript);
+        const redFlag = detectEmergencyRedFlags(cleaned);
+        if (redFlag.isEmergency) {
+          setActiveRedFlag(redFlag);
+        } else {
+          handleProcessTranscript(cleaned);
+        }
       } else {
         setInteractionState('idle');
       }
@@ -270,12 +290,25 @@ export const PatientDashboard: React.FC = () => {
       setTranscript('');
       setInteractionState('listening');
 
+      // Acquire audio stream for Wispr Audio Visualizer
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        navigator.mediaDevices
+          .getUserMedia({ audio: true })
+          .then((stream) => setAudioStream(stream))
+          .catch((e) => console.warn('Audio stream acquisition error:', e));
+      }
+
       const rec = speechService.startListening(spokenLocale, {
         onResult: (text) => {
-          setTranscript(text);
+          const cleaned = cleanWisprTranscript(text);
+          setTranscript(cleaned);
         },
         onError: (err) => {
           console.error('Speech rec error:', err);
+          if (audioStream) {
+            audioStream.getTracks().forEach((track) => track.stop());
+            setAudioStream(null);
+          }
           setErrorMessage(`Microphone error: ${err}. You can type your update directly.`);
           setInteractionState('idle');
         },
@@ -1058,6 +1091,12 @@ export const PatientDashboard: React.FC = () => {
               </h2>
             </div>
 
+            {/* Live Wispr Flow Audio Visualizer */}
+            <WisprAudioVisualizer
+              isRecording={interactionState === 'listening'}
+              stream={audioStream}
+            />
+
             {/* Microphone Button */}
             <div className="relative flex items-center justify-center">
               {interactionState === 'listening' && (
@@ -1109,6 +1148,61 @@ export const PatientDashboard: React.FC = () => {
                 rows={3}
                 className="w-full p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs sm:text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-teal-500"
               />
+
+              {/* Scaler x Wispr Hackathon Quick Demo Scenarios */}
+              <div className="pt-2">
+                <span className="text-[10px] font-extrabold uppercase tracking-wider text-teal-600 dark:text-teal-400 flex items-center gap-1.5 mb-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-teal-500" />
+                  Wispr Flow Hackathon Presets (Click to test instantly):
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const text = "Do din se bukhar kam hai, lekin khansi abhi bhi ho rahi hai aur thoda sar dard hai";
+                      setTranscript(text);
+                      handleProcessTranscript(text);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-teal-50 dark:bg-teal-950/40 text-teal-800 dark:text-teal-300 border border-teal-200 dark:border-teal-800 hover:bg-teal-100 text-[11px] font-semibold transition-all cursor-pointer"
+                  >
+                    1. Hinglish Recovery
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const text = "Kal raat se seene mein bohot tez dard ho raha hai aur saans lene mein takleef hai";
+                      setTranscript(text);
+                      const flag = detectEmergencyRedFlags(text);
+                      if (flag.isEmergency) setActiveRedFlag(flag);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/40 text-rose-800 dark:text-rose-300 border border-rose-200 dark:border-rose-800 hover:bg-rose-100 text-[11px] font-semibold transition-all cursor-pointer"
+                  >
+                    🚨 2. Emergency Triage (Chest Pain)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const text = "पिछले दो दिनों से बुखार तो कम हुआ है लेकिन गले में खराश और बहुत थकान महसूस हो रही है";
+                      setTranscript(text);
+                      handleProcessTranscript(text);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-indigo-50 dark:bg-indigo-950/40 text-indigo-800 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 hover:bg-indigo-100 text-[11px] font-semibold transition-all cursor-pointer"
+                  >
+                    3. Hindi Vernacular
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const text = "গত দুদিন ধরে জ্বর অনেকটা কমেছে, কিন্তু কাশি এখনও আছে আর শরীর দুর্বল লাগছে";
+                      setTranscript(text);
+                      handleProcessTranscript(text);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 hover:bg-emerald-100 text-[11px] font-semibold transition-all cursor-pointer"
+                  >
+                    4. Bengali (বাংলা)
+                  </button>
+                </div>
+              </div>
 
               {transcript && interactionState !== 'listening' && (
                 <div className="flex items-center justify-between gap-3 pt-1">
@@ -1601,8 +1695,16 @@ export const PatientDashboard: React.FC = () => {
                                 </div>
                               )}
 
-                              {/* View Details Button for Consultation */}
-                              <div className="pt-2 flex justify-end">
+                              {/* Action Buttons for Consultation */}
+                              <div className="pt-2 flex items-center justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setExplainingConsultation(consult)}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-bold text-xs shadow-sm transition-all active:scale-95 cursor-pointer"
+                                >
+                                  <Pill className="w-3.5 h-3.5" />
+                                  <span>Dawai Samjho (Voice Guide)</span>
+                                </button>
                                 <button
                                   type="button"
                                   onClick={() => setSelectedTimelineEntry(entry)}
@@ -2425,6 +2527,28 @@ export const PatientDashboard: React.FC = () => {
             });
             loadPatientData();
           }}
+        />
+      )}
+
+      {/* Emergency Red Flag Triage Warning Modal */}
+      {activeRedFlag && (
+        <EmergencyRedFlagModal
+          redFlag={activeRedFlag}
+          onClose={() => setActiveRedFlag(null)}
+          onProceedAnyway={() => {
+            const flag = activeRedFlag;
+            setActiveRedFlag(null);
+            if (flag) handleProcessTranscript(transcript);
+          }}
+        />
+      )}
+
+      {/* Vernacular Audio Prescription Explainer Modal */}
+      {explainingConsultation && (
+        <PrescriptionExplainerModal
+          consultation={explainingConsultation}
+          appLanguage={appLanguage}
+          onClose={() => setExplainingConsultation(null)}
         />
       )}
 

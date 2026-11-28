@@ -48,6 +48,8 @@ import {
 } from '../../types';
 import { UserAvatar } from '../common/UserAvatar';
 import { ProfilePhotoUpload } from '../profile/ProfilePhotoUpload';
+import { DoctorVoicePrescriptionPad } from './DoctorVoicePrescriptionPad';
+import { SymptomTrajectoryChart } from './SymptomTrajectoryChart';
 
 export const DoctorDashboard: React.FC = () => {
   const { appUser, doctorProfile, appLanguage, setAppLanguage, refreshProfile } = useAuth();
@@ -854,6 +856,23 @@ export const DoctorDashboard: React.FC = () => {
     setBaselineSymptoms(baselineSymptoms.filter((_, i) => i !== idx));
   };
 
+  // Handle voice-dictated consultation from Wispr Voice Prescription Pad
+  const handleVoiceParsedConsultation = (data: {
+    chiefComplaints: string;
+    baselineSymptoms: Array<{ symptom: string; severity: 'mild' | 'moderate' | 'severe'; notes?: string }>;
+    diagnosis: string;
+    treatmentPlan: string;
+    followUpAdvice: string;
+  }) => {
+    if (data.chiefComplaints) setChiefComplaints(data.chiefComplaints);
+    if (data.baselineSymptoms && data.baselineSymptoms.length > 0) {
+      setBaselineSymptoms(data.baselineSymptoms);
+    }
+    if (data.diagnosis) setDiagnosis(data.diagnosis);
+    if (data.treatmentPlan) setTreatmentPlan(data.treatmentPlan);
+    if (data.followUpAdvice) setFollowUpAdvice(data.followUpAdvice);
+  };
+
   // Save Consultation (Initial Baseline or Follow-up)
   const handleSaveConsultation = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1554,6 +1573,12 @@ export const DoctorDashboard: React.FC = () => {
                   </div>
                 </div>
               )}
+
+              {/* SECTION: Longitudinal Symptom Trajectory (Scaler x Wispr Flow Innovation) */}
+              <SymptomTrajectoryChart
+                baselineConsultation={initialBaseline}
+                updates={confirmedUpdates}
+              />
 
               {/* SECTION: Intelligent Health Change Brief (Improvement 4) */}
               <div className="p-6 rounded-3xl bg-white dark:bg-slate-900 border-2 border-indigo-500/30 shadow-md space-y-6">
@@ -2616,6 +2641,12 @@ export const DoctorDashboard: React.FC = () => {
                   {t.baselineCheckboxLabel}
                 </label>
               </div>
+
+              {/* Wispr Flow Voice Prescription Pad (Hands-Free OPD Dictation) */}
+              <DoctorVoicePrescriptionPad
+                onParsedConsultation={handleVoiceParsedConsultation}
+                patientName={selectedPatient.fullName}
+              />
 
               {/* 1. Patient-Reported Information */}
               <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 space-y-3">

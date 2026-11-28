@@ -46,12 +46,13 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenSetupGuide, darkMode, setD
               <span className="text-xl font-extrabold tracking-tight bg-gradient-to-r from-teal-700 via-emerald-600 to-teal-500 bg-clip-text text-transparent dark:from-teal-400 dark:to-emerald-300">
                 VoiceFlow
               </span>
-              <span className="text-[10px] font-bold tracking-wide uppercase px-1.5 py-0.5 rounded bg-teal-100 text-teal-800 dark:bg-teal-950 dark:text-teal-300 border border-teal-200 dark:border-teal-800">
-                v1.1
+              <span className="text-[10px] font-extrabold tracking-wide uppercase px-2 py-0.5 rounded-full bg-gradient-to-r from-indigo-500/10 to-teal-500/10 text-indigo-700 dark:text-teal-300 border border-teal-500/30 flex items-center gap-1 shadow-sm">
+                <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-ping"></span>
+                Scaler × Wispr Flow
               </span>
             </div>
             <p className="text-[11px] text-slate-500 dark:text-slate-400 font-medium hidden sm:block">
-              {t.tagline}
+              {t.tagline} • <span className="text-teal-600 dark:text-teal-400 font-semibold">Bharat Voice-First Healthcare</span>
             </p>
           </div>
         </div>

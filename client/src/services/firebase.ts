@@ -3,14 +3,14 @@ import { getAuth, Auth } from 'firebase/auth';
 import { getFirestore, Firestore } from 'firebase/firestore';
 import { getStorage, FirebaseStorage } from 'firebase/storage';
 
-// Client Firebase configuration from Vite environment variables
+// Client Firebase configuration from Vite environment variables (with project defaults)
 export const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || '',
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || 'AIzaSyAx6dItN165Y5bxj_1A0fkY4ruZw4rRW90',
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || 'voiceflow-f53b8.firebaseapp.com',
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || 'voiceflow-f53b8',
   storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || 'voiceflow-f53b8.firebasestorage.app',
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '',
-  appId: import.meta.env.VITE_FIREBASE_APP_ID || '',
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '829541214232',
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || '1:829541214232:web:9c872b071268f7826bfb6d',
 };
 
 export const getMissingFirebaseKeys = (): string[] => {

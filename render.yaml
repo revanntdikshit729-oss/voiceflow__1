@@ -5,20 +5,21 @@ services:
     name: voiceflow-app
     env: node
     plan: free
+    region: singapore
     buildCommand: npm run install:all && npm run build
     startCommand: node server/dist/index.js
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: 20.18.0
       - key: FIREBASE_PROJECT_ID
         value: voiceflow-f53b8
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: FIREBASE_SERVICE_ACCOUNT_KEY
-        sync: false
       - key: GEMINI_MODEL
         value: gemini-3.5-flash-lite
+      - key: GEMINI_API_KEY
+        sync: false
       - key: VITE_FIREBASE_PROJECT_ID
         value: voiceflow-f53b8
       - key: VITE_FIREBASE_AUTH_DOMAIN
@@ -26,8 +27,8 @@ services:
       - key: VITE_FIREBASE_STORAGE_BUCKET
         value: voiceflow-f53b8.firebasestorage.app
       - key: VITE_FIREBASE_API_KEY
-        sync: false
+        value: AIzaSyAx6dItN165Y5bxj_1A0fkY4ruZw4rRW90
       - key: VITE_FIREBASE_MESSAGING_SENDER_ID
-        sync: false
+        value: "829541214232"
       - key: VITE_FIREBASE_APP_ID
-        sync: false
+        value: "1:829541214232:web:9c872b071268f7826bfb6d"
